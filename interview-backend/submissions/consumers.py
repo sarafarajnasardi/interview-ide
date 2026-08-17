@@ -117,10 +117,12 @@ class InterviewRoomConsumer(AsyncWebsocketConsumer):
             InterviewRoomParticipant.objects.filter(
                 channel_name=self.channel_name,
             ).delete()
-            InterviewRoomParticipant.objects.filter(
+
+            if InterviewRoomParticipant.objects.filter(
                 room=room,
                 session_id=self.session_id,
-            ).delete()
+            ).exists():
+                return False
 
             if room.participants.count() >= max_users:
                 return False
@@ -138,9 +140,6 @@ class InterviewRoomConsumer(AsyncWebsocketConsumer):
             InterviewRoomParticipant.objects.filter(
                 channel_name=self.channel_name,
             ).delete()
-
-            if not InterviewRoomParticipant.objects.filter(room_id=self.room_id).exists():
-                InterviewRoom.objects.filter(room_id=self.room_id).delete()
 
     @database_sync_to_async
     def touch_room_slot(self):
