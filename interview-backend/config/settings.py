@@ -133,3 +133,6 @@ CHANNEL_LAYERS = {
         "BACKEND": "channels.layers.InMemoryChannelLayer",
     },
 }
+
+INTERVIEW_ROOM_MAX_USERS = 2
+INTERVIEW_ROOM_PRESENCE_TTL_SECONDS = 90
