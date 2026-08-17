@@ -114,11 +114,12 @@ import OutputBox from "../components/OutputBox.vue"
 
 const route = useRoute()
 const roomId = route.params.roomId
-const clientId = crypto.randomUUID()
+const clientId = createClientId()
 const defaultBackendHost = `${window.location.hostname || "127.0.0.1"}:8083`
 const backendHost = import.meta.env.VITE_BACKEND_HOST || defaultBackendHost
 const httpProtocol = window.location.protocol === "https:" ? "https" : "http"
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || `${httpProtocol}://${backendHost}`
+const heartbeatIntervalMs = 30000
 
 const starterCode = {
   python: `print("Hello, World!")`,
@@ -189,6 +190,7 @@ let hasAnsweredPeerReady = false
 let makingOffer = false
 let ignoreOffer = false
 let isSettingRemoteAnswerPending = false
+let heartbeatTimer = null
 
 const monacoLanguage = computed(() => {
   return monacoLanguageMap[language.value]
@@ -215,8 +217,50 @@ const hasLocalVideo = computed(() => {
 function getWebSocketUrl() {
   const protocol = window.location.protocol === "https:" ? "wss" : "ws"
   const host = import.meta.env.VITE_WS_HOST || backendHost
+  const params = new URLSearchParams({ clientId })
 
-  return `${protocol}://${host}/ws/interview/${roomId}/`
+  return `${protocol}://${host}/ws/interview/${roomId}/?${params.toString()}`
+}
+
+function createClientId() {
+  const storageKey = `interview-client-id:${roomId}`
+  const storedClientId = getStoredClientId(storageKey)
+
+  if (storedClientId) {
+    return storedClientId
+  }
+
+  const browserCrypto = globalThis.crypto
+
+  if (browserCrypto?.randomUUID) {
+    const clientId = browserCrypto.randomUUID()
+    setStoredClientId(storageKey, clientId)
+    return clientId
+  }
+
+  const randomPart = browserCrypto?.getRandomValues
+    ? Array.from(browserCrypto.getRandomValues(new Uint32Array(2)), (value) => value.toString(16)).join("")
+    : Math.random().toString(16).slice(2)
+
+  const clientId = `${Date.now().toString(16)}-${randomPart}`
+  setStoredClientId(storageKey, clientId)
+  return clientId
+}
+
+function getStoredClientId(storageKey) {
+  try {
+    return window.sessionStorage?.getItem(storageKey)
+  } catch {
+    return null
+  }
+}
+
+function setStoredClientId(storageKey, value) {
+  try {
+    window.sessionStorage?.setItem(storageKey, value)
+  } catch {
+    // Storage can be unavailable in private or restricted browser contexts.
+  }
 }
 
 function sendSocketMessage(type, payload = {}) {
@@ -251,11 +295,17 @@ onMounted(() => {
     roomFull.value = false
     output.value = `Connected to interview room: ${roomId}`
     announcePeerReady()
+    startHeartbeat()
   }
 
   socket.value.onmessage = async (event) => {
     const data = JSON.parse(event.data)
     const payload = data.payload || {}
+
+    if (data.type === "room_full") {
+      showRoomFull(payload.message)
+      return
+    }
 
     if (data.type === "presence_update") {
       usersCount.value = payload.users_count
@@ -317,16 +367,15 @@ onMounted(() => {
 
   socket.value.onclose = (event) => {
     isConnected.value = false
+    stopHeartbeat()
     closePeerConnection()
     stopLocalStream()
     wantsCamera.value = false
     wantsMic.value = false
     callState.value = "idle"
 
-    if (event.code === 4001) {
-      roomFull.value = true
-      output.value = "This interview room already has two users."
-      callError.value = "This room is full. Only two users can join for now."
+    if (event.code === 4001 || roomFull.value) {
+      showRoomFull()
       return
     }
 
@@ -335,6 +384,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  stopHeartbeat()
   closePeerConnection()
   stopLocalStream()
 
@@ -398,30 +448,7 @@ async function refreshLocalMedia() {
       throw new Error("Media devices are not available in this browser context.")
     }
 
-    const tracks = []
-    const failures = []
-
-    if (wantsCamera.value) {
-      try {
-        const cameraStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false })
-        tracks.push(...cameraStream.getVideoTracks())
-      } catch (error) {
-        wantsCamera.value = false
-        failures.push("camera")
-        console.error(error)
-      }
-    }
-
-    if (wantsMic.value) {
-      try {
-        const micStream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true })
-        tracks.push(...micStream.getAudioTracks())
-      } catch (error) {
-        wantsMic.value = false
-        failures.push("microphone")
-        console.error(error)
-      }
-    }
+    const { tracks, failures } = await getRequestedMediaTracks()
 
     localStream.value = tracks.length ? new MediaStream(tracks) : null
     attachLocalStream()
@@ -466,6 +493,88 @@ function stopStream(stream) {
   stream?.getTracks().forEach((track) => track.stop())
 }
 
+function startHeartbeat() {
+  stopHeartbeat()
+  heartbeatTimer = window.setInterval(() => {
+    sendSocketMessage("heartbeat")
+  }, heartbeatIntervalMs)
+}
+
+function stopHeartbeat() {
+  if (!heartbeatTimer) return
+
+  window.clearInterval(heartbeatTimer)
+  heartbeatTimer = null
+}
+
+function showRoomFull(message = "This interview room already has two users.") {
+  roomFull.value = true
+  output.value = message
+  callError.value = "Cannot join this room because it already has two users."
+}
+
+async function getRequestedMediaTracks() {
+  const tracks = []
+  const failures = []
+
+  if (!wantsCamera.value && !wantsMic.value) {
+    return { tracks, failures }
+  }
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: wantsCamera.value,
+      audio: wantsMic.value,
+    })
+
+    tracks.push(...stream.getTracks())
+    return { tracks, failures }
+  } catch (error) {
+    console.error(error)
+  }
+
+  if (wantsCamera.value && wantsMic.value) {
+    return getRequestedMediaTracksIndividually()
+  }
+
+  if (wantsCamera.value) {
+    wantsCamera.value = false
+    failures.push("camera")
+  }
+
+  if (wantsMic.value) {
+    wantsMic.value = false
+    failures.push("microphone")
+  }
+
+  return { tracks, failures }
+}
+
+async function getRequestedMediaTracksIndividually() {
+  const tracks = []
+  const failures = []
+
+  try {
+    const cameraStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false })
+    tracks.push(...cameraStream.getVideoTracks())
+  } catch (error) {
+    wantsCamera.value = false
+    failures.push("camera")
+    console.error(error)
+  }
+
+  try {
+    const micStream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true })
+    tracks.push(...micStream.getAudioTracks())
+  } catch (error) {
+    wantsMic.value = false
+    failures.push("microphone")
+    console.error(error)
+  }
+
+  return { tracks, failures }
+}
+
 function announcePeerReady() {
   if (!isConnected.value) return
 
@@ -499,8 +608,7 @@ function createPeerConnection() {
     remoteVideo.value.srcObject = remoteStream.value
   }
 
-  videoTransceiver = connection.addTransceiver("video", { direction: "sendrecv" })
-  audioTransceiver = connection.addTransceiver("audio", { direction: "sendrecv" })
+  initializeTransceivers(connection)
 
   connection.onnegotiationneeded = async () => {
     await negotiateIfStable()
@@ -584,9 +692,39 @@ async function applyLocalMediaToPeer() {
   const videoTrack = localStream.value?.getVideoTracks()[0] || null
   const audioTrack = localStream.value?.getAudioTracks()[0] || null
 
-  await videoTransceiver?.sender.replaceTrack(videoTrack)
-  await audioTransceiver?.sender.replaceTrack(audioTrack)
+  if (videoTransceiver?.sender) {
+    await videoTransceiver.sender.replaceTrack(videoTrack)
+  }
 
+  if (audioTransceiver?.sender) {
+    await audioTransceiver.sender.replaceTrack(audioTrack)
+  }
+}
+
+function initializeTransceivers(connection) {
+  if (typeof connection.addTransceiver !== "function") {
+    videoTransceiver = null
+    audioTransceiver = null
+    callError.value = "This browser does not support required WebRTC features for the call."
+    console.warn("RTCPeerConnection.addTransceiver is not supported in this environment.")
+    return
+  }
+
+  try {
+    videoTransceiver = connection.addTransceiver("video", { direction: "sendrecv" })
+  } catch (error) {
+    videoTransceiver = null
+    callError.value = "Unable to initialize video channel on this device or browser."
+    console.error("Failed to create video transceiver:", error)
+  }
+
+  try {
+    audioTransceiver = connection.addTransceiver("audio", { direction: "sendrecv" })
+  } catch (error) {
+    audioTransceiver = null
+    callError.value = "Unable to initialize audio channel on this device or browser."
+    console.error("Failed to create audio transceiver:", error)
+  }
 }
 
 async function negotiateIfStable() {
