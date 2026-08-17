@@ -162,6 +162,8 @@ class InterviewRoomConsumer(AsyncWebsocketConsumer):
             last_seen__lt=stale_before,
         ).delete()
 
+        InterviewRoom.objects.filter(participants__isnull=True).delete()
+
     def get_session_id(self):
         query_params = parse_qs(self.scope.get("query_string", b"").decode())
         session_id = query_params.get("clientId", [self.channel_name])[0]
